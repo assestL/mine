@@ -1,127 +1,105 @@
 # ===========================================================================
-# movement.py — Перемещение персонажа (с реальными координатами)
-# ===========================================================================
-# Использует F3+C (screen_reader) для получения РЕАЛЬНОЙ позиции
-# вместо внутреннего dead reckoning, который дрейфует.
-#
-# Алгоритм перемещения:
-#   1. F3+C → узнать реальную позицию
-#   2. Повернуть камеру к цели
-#   3. Зажать W на расчётное время
-#   4. F3+C → проверить, дошли ли
-#   5. Повторить если нужно (до 5 попыток)
+# movement.py — Движение персонажа (WASD) и навигация к вейпоинтам
 # ===========================================================================
 
 import time
 import math
-import datetime
-
-import pydirectinput
-
-from math_utils import (
-    calculate_yaw,
-    distance_xz,
-    normalize_angle,
-)
-from camera import look_at_yaw
-from screen_reader import sync_position
+import input_sim
+from config import MOVE_DELAY, random_delay
 
 
-# ---------------------------------------------------------------------------
-# Константы
-# ---------------------------------------------------------------------------
-
-# Скорость ходьбы (блоков/секунду)
-WALK_SPEED = 4.317
-
-# Допуск позиционирования — «дошли», если ближе этого расстояния
-POSITION_TOLERANCE = 1.5
-
-# Максимум попыток перемещения к одной точке
-MAX_ATTEMPTS = 5
-
-# Максимальное время ходьбы за одну попытку (секунды)
-MAX_WALK_TIME = 4.0
-
-
-def _timestamp() -> str:
-    return datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-
-
-def move_to(bot, target_x: float, target_z: float) -> bool:
+class MovementEngine:
     """
-    Перемещает персонажа к указанной горизонтальной позиции.
-
-    Использует реальные координаты из F3+C для навигации.
-    Алгоритм:
-        1. Читаем реальную позицию (F3+C)
-        2. Если уже на месте — выходим
-        3. Поворачиваем камеру в сторону цели
-        4. Зажимаем W на расчётное время (расстояние / скорость)
-        5. Проверяем позицию снова (F3+C)
-        6. Повторяем если не дошли (до MAX_ATTEMPTS раз)
-
-    Аргументы:
-        bot: экземпляр MinecraftBot
-        target_x: целевая координата X
-        target_z: целевая координата Z
-
-    Возвращает:
-        True если дошли, False если не удалось
+    Класс симуляции нажатий клавиш для ходьбы и навигации к точкам.
     """
-    if not bot.is_running:
-        return False
 
-    for attempt in range(MAX_ATTEMPTS):
-        if not bot.is_running:
-            return False
+    def press(self, key: str, duration: float = 0.05) -> None:
+        """
+        Зажимает клавишу на указанное время (с небольшой погрешностью).
+        """
+        input_sim.press_key(key)
+        time.sleep(random_delay(duration, 0.01))
+        input_sim.release_key(key)
 
-        # --- Читаем реальную позицию ---
-        sync_position(bot)
+    def move_forward(self, duration: float = 0.2) -> None:
+        self.press('w', duration)
 
-        dist = distance_xz(bot.current_x, bot.current_z, target_x, target_z)
+    def move_backward(self, duration: float = 0.2) -> None:
+        self.press('s', duration)
 
-        if dist < POSITION_TOLERANCE:
-            return True
+    def move_left(self, duration: float = 0.2) -> None:
+        self.press('a', duration)
 
-        # --- Поворачиваем к цели ---
-        dx = target_x - bot.current_x
-        dz = target_z - bot.current_z
-        target_yaw = calculate_yaw(dx, dz)
+    def move_right(self, duration: float = 0.2) -> None:
+        self.press('d', duration)
 
-        # Поворот камеры горизонтально (pitch=0, смотрим прямо)
-        look_at_yaw(bot, target_yaw, 0.0)
+    def jump(self) -> None:
+        self.press('space', 0.1)
+
+    def sneak(self, duration: float = 0.1) -> None:
+        self.press('shift', duration)
+
+    def navigate_to_block(self, player_pos: tuple[float, float, float], target_pos: tuple[float, float, float], camera, reader) -> None:
+        """
+        Грубая навигация к целевой точке (waypoint).
+        Поворачивает персонажа лицом к цели и шагает вперед.
+        При возникновении препятствия подпрыгивает.
+        """
+        tx, ty, tz = target_pos
+        px, py, pz = player_pos
+
+        dx = tx - px
+        dz = tz - pz
+        dist_xz = math.sqrt(dx**2 + dz**2)
+
+        # 1. Поворачиваем камеру в сторону цели по горизонтали
+        yaw_to_target = math.degrees(math.atan2(dx, dz))
+        camera.smooth_yaw_to(yaw_to_target)
         time.sleep(0.05)
 
-        # --- Идём вперёд ---
-        walk_time = dist / WALK_SPEED
-        walk_time = min(walk_time, MAX_WALK_TIME)
-        walk_time = max(walk_time, 0.2)  # Минимум 200мс
+        # 2. Идем вперед короткими шагами с перепроверкой координат
+        max_attempts = 15
+        attempts = 0
+        stuck_count = 0
+        
+        while dist_xz > 1.5 and attempts < max_attempts:
+            # Запоминаем координаты до шага
+            old_x, old_z = px, pz
 
-        print(
-            f"  [{_timestamp()}] [ДВИЖЕНИЕ] "
-            f"Попытка {attempt + 1}/{MAX_ATTEMPTS}: "
-            f"расстояние={dist:.1f} блоков, "
-            f"ходьба={walk_time:.1f}с"
-        )
-
-        pydirectinput.keyDown('w')
-        # Ходим с проверкой флага остановки
-        walk_start = time.time()
-        while time.time() - walk_start < walk_time:
-            if not bot.is_running:
-                pydirectinput.keyUp('w')
-                return False
+            # Делаем небольшой шаг вперед
+            self.move_forward(0.15)
             time.sleep(0.05)
-        pydirectinput.keyUp('w')
 
-        time.sleep(0.1)  # Пауза после остановки
+            # Считываем новые координаты
+            new_pos = reader.get_player_coords()
+            if new_pos is not None:
+                nx, ny, nz = new_pos
+                # Проверяем достоверность (макс. перемещение игрока за шаг 4.0 блока)
+                if math.sqrt((nx - px)**2 + (ny - py)**2 + (nz - pz)**2) < 4.0:
+                    px, py, pz = nx, ny, nz
+                    dx = tx - px
+                    dz = tz - pz
+                    dist_xz = math.sqrt(dx**2 + dz**2)
+                    
+                    # Проверяем, застрял ли персонаж
+                    dist_moved = math.sqrt((px - old_x)**2 + (pz - old_z)**2)
+                    if dist_moved < 0.1:
+                        stuck_count += 1
+                        if stuck_count >= 3:
+                            print("  [ДВИЖЕНИЕ] Застряли 3 раза подряд, прерываем движение для расчистки пути.")
+                            break
+                        # Пытаемся запрыгнуть на препятствие
+                        self.jump()
+                        time.sleep(0.05)
+                        self.move_forward(0.15)
+                    else:
+                        stuck_count = 0
 
-    # --- Финальная проверка ---
-    sync_position(bot)
-    dist = distance_xz(bot.current_x, bot.current_z, target_x, target_z)
-    if dist < POSITION_TOLERANCE:
-        return True
-
-    print(f"  [{_timestamp()}] [ДВИЖЕНИЕ] Не удалось дойти до ({target_x:.1f}, {target_z:.1f})")
-    return False
+                    # Корректируем направление
+                    yaw_to_target = math.degrees(math.atan2(dx, dz))
+                    camera.smooth_yaw_to(yaw_to_target)
+            else:
+                # Если не удалось прочитать, предполагаем, что продвинулись
+                dist_xz *= 0.85
+                
+            attempts += 1
